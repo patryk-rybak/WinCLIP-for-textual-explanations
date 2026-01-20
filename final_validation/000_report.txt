@@ -1,0 +1,14 @@
+ANOMALY DETECTION REPORT
+============================================================
+Image: 000.png
+Class: screw
+Anomaly Score: 2.090
+
+DETECTED REGIONS (3):
+
+  Region 1: Position (135,133), Score 1.893
+  Region 2: Position (157,165), Score 1.779
+  Region 3: Position (57,70), Score 1.764
+
+EXPLANATION:
+Defect 1 at top-left region (pixel 135,133): low subtle irregularity detected on screw surface, confidence score 1.89. Likely surface irregularity. Defect 2 at top-left region (pixel 157,165): low subtle irregularity detected on screw surface, confidence score 1.78. Likely surface irregularity. Defect 3 at top-left region (pixel 57,70): low subtle irregularity detected on screw surface, confidence score 1.76. Likely surface irregularity. Total 3 anomalous region(s) identified. Moderate anomaly, requires inspection.

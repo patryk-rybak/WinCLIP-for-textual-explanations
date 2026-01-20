@@ -101,6 +101,7 @@ class WinCLIP:
         return F.normalize(normal_anchor, dim=-1), F.normalize(anomalous_anchor, dim=-1)
     
     def compute_foreground_mask(self, image: np.ndarray, threshold=0.05):
+        """Fallback OpenCV-based foreground mask."""
         gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
         mask = (gray > threshold) & (gray < (1.0 - threshold))
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -112,6 +113,30 @@ class WinCLIP:
             mask = np.zeros_like(mask)
             cv2.drawContours(mask, [largest], -1, 1, thickness=-1)
         return mask.astype(bool)
+    
+    def compute_clip_objectness_mask(self, patch_features_dict, global_embedding, threshold=0.15):
+        """CLIP-native objectness: patches similar to global image are object patches."""
+        # Use fused multi-layer features
+        fused = torch.stack([patch_features_dict[k] for k in sorted(patch_features_dict.keys())], 
+                           dim=0).mean(dim=0).squeeze(0)  # (N, D)
+        
+        # Compute patch-to-global similarity
+        patch_to_global_sim = (fused @ global_embedding).cpu().numpy()  # (N,)
+        
+        # Patches with high similarity to global image are object patches
+        # Use a soft threshold to be more permissive
+        object_mask_flat = patch_to_global_sim > threshold
+        object_mask = object_mask_flat.reshape(self.grid_size, self.grid_size)
+        
+        # Resize to image size
+        object_mask_resized = cv2.resize(object_mask.astype(np.uint8), 
+                                        (self.img_size, self.img_size),
+                                        interpolation=cv2.INTER_NEAREST)
+        # Light morphology for smoothness (smaller kernel)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        object_mask_resized = cv2.morphologyEx(object_mask_resized, cv2.MORPH_CLOSE, kernel)
+        
+        return object_mask_resized.astype(bool), object_mask_flat
     
     def build_normal_memory(self, image_paths, normal_anchor, anomalous_anchor, 
                            coreset_ratio=0.1, max_images=50):
@@ -145,7 +170,7 @@ class WinCLIP:
         img_np = np.array(img_pil)
         img_tensor = self.preprocess(img_pil).unsqueeze(0).to(self.device)
         
-        # Foreground mask
+        # Compute foreground mask (proven approach)
         fg_mask = self.compute_foreground_mask(img_np)
         fg_mask_resized = cv2.resize(fg_mask.astype(np.uint8), (self.img_size, self.img_size),
                                      interpolation=cv2.INTER_NEAREST).astype(bool)
@@ -153,16 +178,16 @@ class WinCLIP:
         # Extract features
         patch_features = self.encode_image(img_tensor)
         fused = torch.stack([patch_features[k] for k in sorted(patch_features.keys())], 
-                           dim=0).mean(dim=0).squeeze(0)
+                           dim=0).mean(dim=0).squeeze(0)  # (N, D)
         
-        # Text map
+        # Text similarities (on all patches)
         sim_normal = (fused @ normal_anchor).cpu().numpy()
         sim_anomalous = (fused @ anomalous_anchor).cpu().numpy()
         text_map = (sim_anomalous - sim_normal).reshape(self.grid_size, self.grid_size)
         text_map = cv2.resize(text_map, (self.img_size, self.img_size), 
                              interpolation=cv2.INTER_CUBIC)
         
-        # NN map
+        # NN map (on all patches)
         if self.normal_memory is not None:
             distances = torch.cdist(fused, self.normal_memory, p=2)
             min_dist = distances.min(dim=1)[0].cpu().numpy()
@@ -172,11 +197,14 @@ class WinCLIP:
         else:
             nn_map = np.zeros((self.img_size, self.img_size))
         
-        # Fuse, mask, normalize
+        # Fuse maps
         fused_map = text_weight * text_map + nn_weight * nn_map
-        fused_map *= fg_mask_resized
         
-        # Robust normalize
+        # Apply foreground mask - hard suppression of background
+        fused_map = fused_map * fg_mask_resized
+        fused_map[~fg_mask_resized] = -999
+        
+        # Robust normalize (only on foreground)
         fg_values = fused_map[fg_mask_resized]
         if len(fg_values) > 0:
             median = np.median(fg_values)
@@ -185,15 +213,15 @@ class WinCLIP:
                 fused_map = (fused_map - median) / (mad * 1.4826)
         fused_map = np.clip(fused_map, -3, 10) * fg_mask_resized
         
-        # Smooth
+        # Smooth (preserving foreground boundaries)
         smoothed = cv2.GaussianBlur(fused_map.astype(np.float32), (0, 0), sigmaX=4.0)
-        smoothed *= fg_mask_resized
+        smoothed = smoothed * fg_mask_resized
         
-        # Score & hotspots
+        # Score (only from foreground)
         fg_scores = smoothed[fg_mask_resized]
         image_score = float(np.max(fg_scores)) if len(fg_scores) > 0 else 0.0
         
-        # Find top hotspots
+        # Find top hotspots (ONLY on foreground)
         hotspots = []
         if len(fg_scores) > 0:
             threshold = np.percentile(fg_scores, 95)
@@ -206,58 +234,170 @@ class WinCLIP:
                     if M["m00"] > 0:
                         cx = int(M["m10"] / M["m00"])
                         cy = int(M["m01"] / M["m00"])
-                        score = float(smoothed[cy, cx])
-                        hotspots.append((cx, cy, score))
+                        # Validate: only accept if on foreground
+                        if fg_mask_resized[cy, cx]:
+                            score = float(smoothed[cy, cx])
+                            hotspots.append((cx, cy, score))
             hotspots = sorted(hotspots, key=lambda x: x[2], reverse=True)[:5]
         
         return AnomalyResult(smoothed, image_score, fg_mask_resized, hotspots)
 
 
 class LLaVAExplainer:
-    def __init__(self):
-        try:
-            from vllm import LLM, SamplingParams
-            self.llm = LLM(model="llava-hf/llava-onevision-qwen2-0.5b-ov-hf",
-                          gpu_memory_utilization=0.25, max_model_len=2048)
-            self.sampling = SamplingParams(temperature=0.2, max_tokens=200, stop=["\n\n"])
-            self.enabled = True
-            print("LLaVA loaded")
-        except Exception as e:
-            print(f"LLaVA not available: {e}")
-            self.enabled = False
-    
-    def explain(self, image: np.ndarray, result: AnomalyResult, class_name: str):
-        if not self.enabled or not result.hotspots:
-            return self._fallback_explain(result, class_name)
+    def __init__(self, model_name="llava-hf/llava-onevision-qwen2-0.5b-ov-hf", 
+                 gpu_util=0.25, auto_start=True):
+        self.model_name = model_name
+        self.gpu_util = gpu_util
+        self.llm = None
+        self.sampling = None
+        self.enabled = False
         
-        # Prepare full image for context
+        if auto_start:
+            self._init_llava()
+    
+    def _init_llava(self, retries=3):
+        """Initialize LLaVA with retry logic."""
+        import time
+        for attempt in range(retries):
+            try:
+                from vllm import LLM, SamplingParams
+                print(f"Loading LLaVA (attempt {attempt+1}/{retries})...")
+                self.llm = LLM(model=self.model_name,
+                              gpu_memory_utilization=self.gpu_util, 
+                              max_model_len=2048,
+                              trust_remote_code=True)
+                self.sampling = SamplingParams(temperature=0.2, max_tokens=200, 
+                                              stop=["\n\n", "<|endoftext|>"])
+                self.enabled = True
+                print("✓ LLaVA loaded successfully")
+                return True
+            except Exception as e:
+                print(f"LLaVA init attempt {attempt+1} failed: {e}")
+                if attempt < retries - 1:
+                    time.sleep(2 ** attempt)  # Exponential backoff
+                else:
+                    print("LLaVA unavailable, using deterministic fallback")
+                    self.enabled = False
+        return False
+    
+    def explain(self, image: np.ndarray, result: AnomalyResult, class_name: str, 
+               heatmap: np.ndarray = None):
+        """Generate explanation - GUARANTEED non-empty output."""
+        # Validate hotspots are on object
+        valid_hotspots = [
+            (x, y, s) for x, y, s in result.hotspots 
+            if result.foreground_mask[y, x]
+        ]
+        
+        if not valid_hotspots:
+            return f"No defect visible on the {class_name} object. All detected regions were background noise or below confidence threshold."
+        
+        # Update result with validated hotspots
+        result.hotspots = valid_hotspots
+        
+        # Try LLaVA if enabled
+        if self.enabled and self.llm is not None:
+            try:
+                explanation = self._llava_explain(image, result, class_name, heatmap)
+                if explanation and len(explanation.strip()) > 10:
+                    return explanation
+            except Exception as e:
+                print(f"LLaVA inference failed: {e}, using fallback")
+        
+        # Deterministic fallback - ALWAYS produces output
+        return self._deterministic_fallback(result, class_name, image.shape)
+    
+    def _llava_explain(self, image: np.ndarray, result: AnomalyResult, 
+                      class_name: str, heatmap: np.ndarray):
+        """Call LLaVA with proper formatting."""
+        import base64
+        from io import BytesIO
+        
+        # Convert image to base64 data URL
         img_pil = Image.fromarray(image)
+        buffered = BytesIO()
+        img_pil.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+        img_url = f"data:image/png;base64,{img_base64}"
         
-        # Build prompt
-        prompt = (f"This is an image of a {class_name}. "
-                 f"Detected {len(result.hotspots)} potential defects. "
-                 f"Describe what you see at the marked regions. "
-                 f"Be precise about location, shape, texture, and severity. "
-                 f"If no defect visible, say 'no defect'. Avoid speculation.")
+        # Build prompt for industrial inspection
+        hotspot_locs = ", ".join([f"({x},{y})" for x, y, _ in result.hotspots[:3]])
+        prompt = (
+            f"<image>\n\nYou are inspecting an industrial {class_name} for defects. "
+            f"Anomaly detected at positions: {hotspot_locs}. "
+            f"Describe the abnormal region precisely: shape, location, texture, severity. "
+            f"If nothing is wrong, say 'no defect visible'. Avoid speculation."
+        )
         
-        # Note: Actual vLLM multi-modal API would require proper formatting
-        # For now, use fallback with structure
-        return self._fallback_explain(result, class_name)
+        # Generate with retry
+        for attempt in range(3):
+            try:
+                outputs = self.llm.generate(
+                    {"prompt": prompt, "multi_modal_data": {"image": img_url}},
+                    sampling_params=self.sampling
+                )
+                if outputs and len(outputs) > 0:
+                    text = outputs[0].outputs[0].text.strip()
+                    if text:
+                        return text
+            except Exception as e:
+                if attempt == 2:
+                    raise e
+        return None
     
-    def _fallback_explain(self, result: AnomalyResult, class_name: str):
-        if not result.hotspots:
-            return f"No significant anomalies detected in {class_name}."
-        
+    def _deterministic_fallback(self, result: AnomalyResult, class_name: str, 
+                               img_shape: tuple):
+        """Deterministic fallback that NEVER returns empty string."""
+        H, W = img_shape[:2]
         explanations = []
+        
         for i, (x, y, score) in enumerate(result.hotspots[:3], 1):
-            severity = "high" if score > 2.0 else "moderate" if score > 1.0 else "low"
-            loc = "center" if 0.3 < x/224 < 0.7 and 0.3 < y/224 < 0.7 else "edge"
+            # Determine severity
+            if score > 3.0:
+                severity = "high-severity"
+                issue = "significant structural defect"
+            elif score > 2.0:
+                severity = "moderate"
+                issue = "visible anomaly"
+            else:
+                severity = "low"
+                issue = "subtle irregularity"
+            
+            # Determine location
+            x_rel, y_rel = x / W, y / H
+            if y_rel < 0.33:
+                loc_v = "top"
+            elif y_rel < 0.67:
+                loc_v = "middle"
+            else:
+                loc_v = "bottom"
+            
+            if x_rel < 0.33:
+                loc_h = "left"
+            elif x_rel < 0.67:
+                loc_h = "center"
+            else:
+                loc_h = "right"
+            
+            location = f"{loc_v}-{loc_h}" if loc_v != "middle" or loc_h != "center" else "center"
+            
+            # Build description
             explanations.append(
-                f"Region {i} ({loc}, score={score:.2f}): "
-                f"Anomalous area with {severity} confidence. "
-                f"Located at ({x}, {y})."
+                f"Defect {i} at {location} region (pixel {x},{y}): "
+                f"{severity} {issue} detected on {class_name} surface, "
+                f"confidence score {score:.2f}. "
+                f"Likely {'scratch/dent/damage' if score > 2.0 else 'surface irregularity'}."
             )
-        return " | ".join(explanations)
+        
+        summary = f"Total {len(result.hotspots)} anomalous region(s) identified. "
+        if result.image_score > 3.0:
+            summary += "Major defect detected, object should be rejected."
+        elif result.image_score > 1.5:
+            summary += "Moderate anomaly, requires inspection."
+        else:
+            summary += "Minor irregularity detected."
+        
+        return " ".join(explanations) + " " + summary
 
 
 def detect_and_explain(winclip, image_path, normal_anchor, anomalous_anchor,
@@ -272,12 +412,13 @@ def detect_and_explain(winclip, image_path, normal_anchor, anomalous_anchor,
     # Detect
     result = winclip.detect(image_path, normal_anchor, anomalous_anchor)
     
-    # Explain
-    explainer = LLaVAExplainer() if use_llava else None
-    if explainer and explainer.enabled:
-        explanation = explainer.explain(img, result, class_name)
-    else:
-        explanation = explainer._fallback_explain(result, class_name) if explainer else "No explanation"
+    # Explain - ALWAYS produces output
+    explainer = LLaVAExplainer(auto_start=use_llava)
+    explanation = explainer.explain(img, result, class_name, heatmap=result.anomaly_map)
+    
+    # Sanity check: explanation must never be empty
+    if not explanation or len(explanation.strip()) < 10:
+        explanation = explainer._deterministic_fallback(result, class_name, img.shape)
     
     # Save heatmap
     fig, ax = plt.subplots(1, 1, figsize=(8, 8))
