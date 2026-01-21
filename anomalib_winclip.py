@@ -2,62 +2,104 @@ import os
 from pathlib import Path
 
 import torch
-from anomalib.data import ImageItem, MVTecAD
+from anomalib.data import MVTecAD
 from anomalib.models.image import WinClip
-from anomalib.visualization.image.item_visualizer import visualize_image_item
-
-import torch.nn.functional as F
 from torchvision.utils import save_image
+import torch.nn.functional as F
 
 
 def extract_max_anomaly_crop(
     image: torch.Tensor,          # (3, H, W)
     anomaly_map: torch.Tensor,    # (h, w)
     crop_size: int = 256,
-    out_size: int = 1024,
 ):
     """
-    Zwraca zoomowany crop obrazu wokół punktu maksymalnej anomalii.
+    Zaznacza na obrazie czerwonym obramowaniem obszary wokół
+    1–2 najsilniejszych, rozdzielnych punktów anomalii.
     """
     _, H, W = image.shape
     h, w = anomaly_map.shape
 
-    # 1. Argmax w anomaly_map
-    flat_idx = torch.argmax(anomaly_map)
-    y_map, x_map = divmod(flat_idx.item(), w)
+    # 1. Wybór 1–2 lokalnych maksimów (bardziej stabilnie niż top-2)
+    if anomaly_map.numel() == 0:
+        return image
 
-    # 2. Skalowanie do rozdzielczości obrazu
+    am = anomaly_map
+    pooled = F.max_pool2d(am[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+    peaks = (am == pooled)
+
+    peak_vals = am[peaks]
+    if peak_vals.numel() == 0:
+        return image
+
+    peak_indices = torch.nonzero(peaks, as_tuple=False)
+    # sortuj piki po wartości (malejąco)
+    sorted_idx = torch.argsort(peak_vals, descending=True)
+
+    # próg względny dla drugiego piku
+    rel_threshold = 0.4
+    min_separation = max(1, int(0.1 * min(h, w)))
+
+    selected = []
+    for idx in sorted_idx:
+        y_new, x_new = peak_indices[idx].tolist()
+        val = peak_vals[idx]
+
+        if not selected:
+            selected.append((val, y_new, x_new))
+            continue
+
+        # zaakceptuj drugi pik tylko jeśli jest wystarczająco silny
+        if val < selected[0][0] * rel_threshold:
+            continue
+
+        y_prev, x_prev = selected[0][1], selected[0][2]
+        if abs(y_new - y_prev) < min_separation and abs(x_new - x_prev) < min_separation:
+            continue
+
+        selected.append((val, y_new, x_new))
+        break
+
+    # 2. Skalowanie do rozdzielczości obrazu i wyznaczenie ramek
     scale_y = H / h
     scale_x = W / w
-
-    y_img = int(y_map * scale_y)
-    x_img = int(x_map * scale_x)
-
-    # 3. Wyznaczenie cropa
     half = crop_size // 2
 
-    y1 = max(0, y_img - half)
-    y2 = min(H, y_img + half)
-    x1 = max(0, x_img - half)
-    x2 = min(W, x_img + half)
+    # 4. Zaznaczenie czerwonej ramki na oryginalnym obrazie
+    # (ramka o grubości 2 px)
+    marked = image.clone()
+    thickness = 2
 
-    crop = image[:, y1:y2, x1:x2]
+    red = torch.tensor([1.0, 0.0, 0.0]).view(3, 1, 1)
 
-    # 4. Jeśli crop jest mniejszy (krawędzie obrazu) → resize
-    crop = crop.unsqueeze(0)  # (1, 3, h, w)
-    crop = F.interpolate(
-        crop,
-        size=(out_size, out_size),
-        mode="bilinear",
-        align_corners=False,
-    )
+    for _, y_map, x_map in selected:
+        y_img = int(y_map * scale_y)
+        x_img = int(x_map * scale_x)
 
-    return crop.squeeze(0)  # (3, out_size, out_size)
+        y1 = max(0, y_img - half)
+        y2 = min(H, y_img + half)
+        x1 = max(0, x_img - half)
+        x2 = min(W, x_img + half)
+
+        # upewnij się, że ramka mieści się w obrazie
+        y1b = max(0, y1)
+        y2b = min(H, y2)
+        x1b = max(0, x1)
+        x2b = min(W, x2)
+
+        # górna i dolna krawędź
+        marked[:, y1b:y1b + thickness, x1b:x2b] = red
+        marked[:, y2b - thickness:y2b, x1b:x2b] = red
+        # lewa i prawa krawędź
+        marked[:, y1b:y2b, x1b:x1b + thickness] = red
+        marked[:, y1b:y2b, x2b - thickness:x2b] = red
+
+    return marked
 
 
 def save_anomaly_predicitons(
     category="screw",
-    output_dir="./predictions",
+    output_dir=Path("./predictions"),
 ):
     # --------------------------------------------------
     # 1. Dataset
@@ -91,6 +133,7 @@ def save_anomaly_predicitons(
     img_idx = 0
     for batch in test_loader:
         images = batch.image.to(device)
+        image_paths = batch.image_path
 
         batch_size = images.shape[0]
 
@@ -102,49 +145,23 @@ def save_anomaly_predicitons(
 
             anomaly_map = outputs.anomaly_map[i].cpu()
             pred_label = outputs.pred_label[i].item()
-            pred_score = outputs.pred_score[i].item()
-            pred_mask = outputs.pred_mask[i].cpu()
 
-            zoom = extract_max_anomaly_crop(
+            marked = extract_max_anomaly_crop(
                 image=image,
                 anomaly_map=anomaly_map,
                 crop_size=256,
-                out_size=1024,
             )
 
-            concat = torch.cat([image, zoom], dim=2)
-
             label_txt = "ANOMALIA" if pred_label else "NORMALNY"
+            # zapis do: predictions/<category>/<subdir>/...
+            subdir = Path(image_paths[i]).parent.name
+            out_dir = output_dir / subdir
+            out_dir.mkdir(parents=True, exist_ok=True)
+
             out_name = f"image_{img_idx:03d}_{label_txt}.png"
-            out_path = os.path.join(output_dir, out_name)
+            out_path = out_dir / out_name
 
-            save_image(concat, out_path)
-
-            SAVE_ADDITIONAL_ANOMALY_MASK = True
-
-            if SAVE_ADDITIONAL_ANOMALY_MASK:
-
-                item = ImageItem(
-                    image=image,
-                    image_path=None,
-                    anomaly_map=anomaly_map,
-                    pred_mask=pred_mask,
-                    pred_score=pred_score,
-                    pred_label=pred_label,
-                )
-                vis = visualize_image_item(
-                    item,
-                    fields=None,
-                    overlay_fields=[("image", ["anomaly_map"])],
-                    overlay_fields_config={
-                        "anomaly_map": {"colormap": True, "normalize": True},
-                    },
-                    text_config={"enable": False},
-                )
-
-                out_name_anomaly = f"image_{img_idx:03d}_{label_txt}_anomaly_amp.png"
-                out_path_anomaly = os.path.join(output_dir, out_name_anomaly)
-                vis.save(out_path_anomaly)
+            save_image(marked, out_path)
 
             print(f"[{label_txt}] {out_name} | label={pred_label}")
             img_idx += 1
@@ -157,7 +174,14 @@ def save_anomaly_predicitons(
 # URUCHOMIENIE
 # --------------------------------------------------
 if __name__ == "__main__":
-    save_anomaly_predicitons(
-        category="screw",
-        output_dir="./predictions",
-    )
+    dataset_root = Path("./dataset")
+    predictions_root = Path("./predictions")
+
+    for category_dir in sorted(p for p in dataset_root.iterdir() if p.is_dir()):
+        category = category_dir.name
+        output_dir = predictions_root / category
+
+        save_anomaly_predicitons(
+            category=category,
+            output_dir=output_dir,
+        )
